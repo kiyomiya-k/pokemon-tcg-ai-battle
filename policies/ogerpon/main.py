@@ -1,0 +1,637 @@
+"""Teal Mask Ogerpon ex — mono-attacker rule-based agent
+
+Design: docs/superpowers/specs/2026-08-06-ogerpon-pilot-design.md
+Deck: the 222-game ladder list (references/ogerpon-deck2.csv), unmodified.
+Only Pokemon: Teal Mask Ogerpon ex x4 (Tera, Grass, HP210, retreat 1).
+
+Core math (fully deterministic):
+  Myriad Leaf Shower ({G}{G}{G}) = 30 + 30 x (energy on BOTH Active Pokemon)
+  x2 vs Grass-weak targets (Marnie's Grimmsnarl ex line, etc.)
+
+Turn shape:
+  Teal Dance on every Ogerpon (attach {G} from hand + draw), dig with
+  Bug Catching Set / Energy Search / Tera Orb / Pokegear, keep 1-2 benched
+  backups charging, always attack when legal, Boss/N's Plan for lethal.
+
+Score system mirrors llcc_stable: setup/play/attach 1000..90000, attack =
+damage so it goes last, negative = skip when above minCount.
+"""
+
+import os
+import random
+import sys
+
+try:
+    ROOT = __file__
+except NameError:
+    ROOT = None
+CG_PATH = "/kaggle_simulations/agent"
+for p in ([os.path.dirname(os.path.abspath(ROOT))] if ROOT else []) + [CG_PATH]:
+    if p and p not in sys.path and os.path.isdir(p):
+        sys.path.insert(0, p)
+
+from cg.api import (
+    AreaType,
+    EnergyType,
+    OptionType,
+    SelectContext,
+    all_card_data,
+    to_observation_class,
+)
+
+# ── Card IDs ──
+
+OGERPON_EX = 96
+GRASS_ENERGY = 1
+GROW_GRASS = 18
+
+BUG_CATCHING_SET = 1094
+ENERGY_RETRIEVAL = 1118
+ENERGY_SEARCH = 1119
+CRUSHING_HAMMER = 1120
+POKEGEAR = 1122
+TERA_ORB = 1127
+TOOL_SCRAPPER = 1137
+JUMBO_ICE_CREAM = 1147
+HERO_CAPE = 1159
+BOSS = 1182
+BRIAR = 1201
+JUDGE = 1213
+NS_PLAN = 1221
+HARLEQUIN = 1223
+LILLIE = 1227
+LIVELY_STADIUM = 1251
+
+ENERGY_IDS = {GRASS_ENERGY, GROW_GRASS}
+DRAW_SUPPORTERS = {LILLIE, JUDGE, HARLEQUIN}
+
+CARD_DB = {c.cardId: c for c in all_card_data()}
+
+MYRIAD_LEAF_SHOWER = 120
+
+
+# ── Board helpers (llcc conventions) ──
+
+def read_deck_csv():
+    fp = "deck.csv"
+    if not os.path.exists(fp):
+        fp = "/kaggle_simulations/agent/deck.csv"
+    with open(fp) as f:
+        return [int(line) for line in f.read().strip().split("\n")]
+
+
+def get_card(obs, area, index, player_index):
+    if area is None or index is None:
+        return None
+    ps = obs.current.players[player_index]
+    if area == AreaType.DECK and obs.select and obs.select.deck is not None:
+        return obs.select.deck[index] if index < len(obs.select.deck) else None
+    if area == AreaType.HAND and ps.hand is not None:
+        return ps.hand[index] if index < len(ps.hand) else None
+    if area == AreaType.DISCARD:
+        return ps.discard[index] if index < len(ps.discard) else None
+    if area == AreaType.ACTIVE:
+        return ps.active[index] if index < len(ps.active) else None
+    if area == AreaType.BENCH:
+        return ps.bench[index] if index < len(ps.bench) else None
+    if area == AreaType.PRIZE:
+        return ps.prize[index] if index < len(ps.prize) else None
+    if area == AreaType.STADIUM:
+        return obs.current.stadium[index] if index < len(obs.current.stadium) else None
+    if area == AreaType.LOOKING and obs.current.looking is not None:
+        return obs.current.looking[index] if index < len(obs.current.looking) else None
+    return None
+
+
+def option_card(obs, opt):
+    yi = obs.current.yourIndex
+    pi = opt.playerIndex if opt.playerIndex is not None else yi
+    if opt.type == OptionType.PLAY:
+        return get_card(obs, AreaType.HAND, opt.index, pi)
+    return get_card(obs, opt.area, opt.index, pi)
+
+
+def option_target(obs, opt):
+    if opt.inPlayArea is None or opt.inPlayIndex is None:
+        return None
+    return get_card(obs, opt.inPlayArea, opt.inPlayIndex, obs.current.yourIndex)
+
+
+def my_state(obs):
+    return obs.current.players[obs.current.yourIndex]
+
+
+def opp_state(obs):
+    return obs.current.players[1 - obs.current.yourIndex]
+
+
+def active_pokemon(obs):
+    ps = my_state(obs)
+    return ps.active[0] if ps.active else None
+
+
+def opp_active_pokemon(obs):
+    ps = opp_state(obs)
+    return ps.active[0] if ps.active else None
+
+
+def opp_bench_pokemon(obs):
+    return [p for p in opp_state(obs).bench if p]
+
+
+def my_bench_pokemon(obs):
+    return [p for p in my_state(obs).bench if p]
+
+
+def all_my_pokemon(obs):
+    ps = my_state(obs)
+    return [p for p in (ps.active + ps.bench) if p]
+
+
+def hand_ids(obs):
+    hand = my_state(obs).hand
+    return [c.id for c in hand if c] if hand else []
+
+
+def energy_count(pokemon):
+    if pokemon is None:
+        return 0
+    if getattr(pokemon, "energyCards", None) is not None:
+        return len(pokemon.energyCards)
+    return len(getattr(pokemon, "energies", []) or [])
+
+
+def has_tool(pokemon):
+    return bool(getattr(pokemon, "tools", []) or [])
+
+
+def damage_on(pokemon):
+    if pokemon is None:
+        return 0
+    return max(0, getattr(pokemon, "maxHp", pokemon.hp) - pokemon.hp)
+
+
+def prize_value(pokemon):
+    data = CARD_DB.get(pokemon.id) if pokemon else None
+    if data and getattr(data, "megaEx", False):
+        return 3
+    if data and getattr(data, "ex", False):
+        return 2
+    return 1
+
+
+def is_grass_weak(pokemon):
+    if pokemon is None:
+        return False
+    data = CARD_DB.get(pokemon.id)
+    w = getattr(data, "weakness", None) if data else None
+    if w is None:
+        return False
+    return int(getattr(w, "value", w)) == int(EnergyType.GRASS)
+
+
+# ── Damage math ──
+
+def shower_damage(obs, my_energy=None, target=None):
+    """Myriad Leaf Shower vs `target` assuming it sits in the Active Spot."""
+    if my_energy is None:
+        my_energy = energy_count(active_pokemon(obs))
+    if target is None:
+        target = opp_active_pokemon(obs)
+    dmg = 30 + 30 * (my_energy + energy_count(target))
+    return dmg * 2 if is_grass_weak(target) else dmg
+
+
+def can_attack(obs, pokemon=None):
+    if pokemon is None:
+        pokemon = active_pokemon(obs)
+    return pokemon is not None and pokemon.id == OGERPON_EX and energy_count(pokemon) >= 3
+
+
+def grass_in_hand(obs):
+    return sum(1 for c in (my_state(obs).hand or []) if c and c.id == GRASS_ENERGY)
+
+
+def ogerpon_in_play(obs):
+    return sum(1 for p in all_my_pokemon(obs) if p.id == OGERPON_EX)
+
+
+def best_backup(obs):
+    """Benched Ogerpon with the most energy (next attacker)."""
+    bench = [p for p in my_bench_pokemon(obs) if p.id == OGERPON_EX]
+    return max(bench, key=energy_count) if bench else None
+
+
+# ── Scoring ──
+
+def score_setup(obs, opt):
+    ctx = obs.select.context
+    card = option_card(obs, opt)
+    cid = card.id if card else None
+
+    if ctx == SelectContext.MULLIGAN:
+        return (10000, "no mulligan") if opt.type == OptionType.NO else (0, "mulligan")
+    if ctx == SelectContext.IS_FIRST:
+        return (10000, "choose second") if opt.type == OptionType.NO else (0, "go first")
+    if ctx == SelectContext.SETUP_ACTIVE_POKEMON:
+        return (100000, "Active: Ogerpon") if cid == OGERPON_EX else (0, "unknown")
+    if ctx == SelectContext.SETUP_BENCH_POKEMON:
+        # Mono-deck: an empty bench loses to one KO. Bench one spare.
+        benched = len([p for p in my_state(obs).bench if p])
+        if cid == OGERPON_EX and benched < 1:
+            return 5000, "setup bench: 1 spare Ogerpon"
+        return -10000, "setup bench: enough"
+    return 0, "non-setup"
+
+
+def score_play(obs, opt):
+    card = option_card(obs, opt)
+    cid = card.id if card else None
+    ids = hand_ids(obs)
+    deck_count = my_state(obs).deckCount
+    opp_act = opp_active_pokemon(obs)
+
+    # ── Pokemon ──
+    if cid == OGERPON_EX:
+        benched = len(my_bench_pokemon(obs))
+        if benched < 2:
+            return 22000, "bench spare Ogerpon"
+        if benched < 3 and ids.count(OGERPON_EX) > 1:
+            return 3000, "bench 3rd Ogerpon"
+        return -500, "bench full enough"
+
+    # ── Stadium ──
+    if cid == LIVELY_STADIUM:
+        # +30 HP to Basics. We are all Basic; evolution decks profit less.
+        stadium = obs.current.stadium[0] if obs.current.stadium else None
+        if stadium is not None and getattr(stadium, "id", None) == LIVELY_STADIUM:
+            return -500, "stadium already ours"
+        return 15000, "play Lively Stadium"
+
+    # ── Items ──
+    if cid in (BUG_CATCHING_SET, ENERGY_SEARCH, TERA_ORB, POKEGEAR):
+        if deck_count <= 6:
+            return -2000, "deck low: stop digging"
+        if cid == ENERGY_SEARCH:
+            return 20000, "Energy Search"
+        if cid == TERA_ORB:
+            total_seen = ogerpon_in_play(obs) + ids.count(OGERPON_EX)
+            if total_seen >= 3:
+                return -500, "Tera Orb: enough Ogerpon"
+            return 20000, "Tera Orb: fetch Ogerpon"
+        if cid == POKEGEAR:
+            if obs.current.supporterPlayed:
+                return 1500, "Pokegear: supporter used, dig for next turn"
+            return 19000, "Pokegear"
+        return 20000, "Bug Catching Set"
+
+    if cid == CRUSHING_HAMMER:
+        # Own damage feeds on opponent energy: don't strip it when we already KO.
+        if opp_act and can_attack(obs) and shower_damage(obs) >= opp_act.hp:
+            return -500, "Hammer: already lethal, keep their energy"
+        best = opp_act if energy_count(opp_act) > 0 else None
+        for p in opp_bench_pokemon(obs):
+            if energy_count(p) > energy_count(best) if best else energy_count(p) > 0:
+                best = p
+        if best is None:
+            return -500, "Hammer: no energy to strip"
+        return 18000, "Crushing Hammer"
+
+    if cid == JUMBO_ICE_CREAM:
+        act = active_pokemon(obs)
+        if act and energy_count(act) >= 3 and damage_on(act) >= 60:
+            return 20000, "Ice Cream heal"
+        return -500, "Ice Cream: save"
+
+    if cid == TOOL_SCRAPPER:
+        opp_tools = any(has_tool(p) for p in ([opp_act] if opp_act else []) + opp_bench_pokemon(obs))
+        if opp_tools:
+            return 17000, "Tool Scrapper"
+        return -500, "Tool Scrapper: no target"
+
+    if cid == ENERGY_RETRIEVAL:
+        disc_energy = sum(1 for c in (my_state(obs).discard or []) if c and c.id == GRASS_ENERGY)
+        if disc_energy >= 1 and grass_in_hand(obs) == 0:
+            return 18000, "Energy Retrieval"
+        return -500, "Energy Retrieval: save"
+
+    # ── Supporters ──
+    if cid in (BOSS, BRIAR, LILLIE, JUDGE, HARLEQUIN, NS_PLAN):
+        if obs.current.supporterPlayed:
+            return -1000, "Supporter already used"
+
+    if cid == BOSS:
+        act = active_pokemon(obs)
+        my_e = energy_count(act) if act else 0
+        remaining = len(my_state(obs).prize)
+        if not can_attack(obs):
+            return -500, "Boss: cannot attack"
+        # Never Boss away a KO we already have, unless bench target wins the game.
+        active_lethal = opp_act and shower_damage(obs) >= opp_act.hp
+        best_score = -500
+        best_reason = "save Boss"
+        for target in opp_bench_pokemon(obs):
+            eff = shower_damage(obs, my_energy=my_e, target=target)
+            hp_bonus = 30 if _lively_up(obs) else 0
+            if eff >= target.hp + hp_bonus:
+                pv = prize_value(target)
+                if pv >= remaining:
+                    return 21000, "LETHAL Boss"
+                s = 5000 + pv * 1500 + energy_count(target) * 300
+                if s > best_score:
+                    best_score = s
+                    best_reason = "Boss: pull killable loaded target"
+        if active_lethal and best_score < 21000:
+            if prize_value(opp_act) >= 2 or best_score < 8000:
+                return -500, "Boss: active KO is fine"
+        return best_score, best_reason
+
+    if cid == BRIAR:
+        if len(opp_state(obs).prize) == 2 and can_attack(obs) and opp_act and shower_damage(obs) >= opp_act.hp:
+            return 20500, "Briar: bonus prize on KO"
+        return -500, "Briar: condition not met"
+
+    if cid == NS_PLAN:
+        # Move 2 bench energy to active: +60 (x2 vs weak) — use when it flips lethal.
+        act = active_pokemon(obs)
+        backup = best_backup(obs)
+        if act and opp_act and backup and energy_count(backup) >= 1:
+            move = min(2, energy_count(backup))
+            now = shower_damage(obs)
+            then = shower_damage(obs, my_energy=energy_count(act) + move)
+            if now < opp_act.hp <= then:
+                return 20800, "N's Plan: flip to lethal"
+            if energy_count(act) < 3 and energy_count(act) + move >= 3:
+                return 16000, "N's Plan: enable attack"
+        return -500, "N's Plan: save"
+
+    if cid == LILLIE:
+        if len(ids) <= 4:
+            return 16000, "Lillie: refresh small hand"
+        return 2000, "Lillie"
+
+    if cid == JUDGE:
+        opp_hand = opp_state(obs).handCount
+        if opp_hand >= 6 and len(ids) <= 5:
+            return 15000, "Judge: strip big hand"
+        if len(ids) <= 3:
+            return 9000, "Judge: refresh"
+        return -500, "Judge: save"
+
+    if cid == HARLEQUIN:
+        if len(ids) <= 2:
+            return 8000, "Harlequin: desperate refresh"
+        return -500, "Harlequin: save"
+
+    return 1000, "generic play"
+
+
+def _lively_up(obs):
+    st = obs.current.stadium[0] if obs.current.stadium else None
+    return st is not None and getattr(st, "id", None) == LIVELY_STADIUM
+
+
+def score_attach(obs, opt):
+    card = option_card(obs, opt)
+    target = option_target(obs, opt)
+    cid = card.id if card else None
+    tid = target.id if target else None
+
+    if cid == HERO_CAPE:
+        if tid == OGERPON_EX and target and not has_tool(target):
+            area_bonus = 2000 if opt.inPlayArea == AreaType.ACTIVE else 0
+            return 12000 + area_bonus, "Hero's Cape on Ogerpon"
+        return -1000, "save Hero's Cape"
+
+    if cid not in ENERGY_IDS:
+        return -500, "skip non-energy attach"
+    if obs.current.energyAttached:
+        return -1000, "already attached"
+    return attach_target_score(obs, target, opt.inPlayArea), "attach energy"
+
+
+def attach_target_score(obs, target, area):
+    """Manual attach: active first until attack-ready+1, then charge backup."""
+    if target is None or target.id != OGERPON_EX:
+        return -500
+    e = energy_count(target)
+    act = active_pokemon(obs)
+    is_active = area == AreaType.ACTIVE
+    score = 5000
+    if is_active:
+        if e < 3:
+            score += 12000        # reach attack cost first
+        elif e < 6:
+            score += 6000         # damage still scales
+        else:
+            score += 1000
+        # Active about to die: prefer charging the backup instead.
+        opp_act = opp_active_pokemon(obs)
+        if act and opp_act and act.hp <= 90:
+            score -= 8000
+    else:
+        if e < 3:
+            score += 7000         # backup toward attack-ready
+        else:
+            score += 2000
+    return score
+
+
+def score_retreat(obs, opt):
+    act = active_pokemon(obs)
+    backup = best_backup(obs)
+    if act and backup and energy_count(act) == 0 and energy_count(backup) >= 3:
+        return 12000, "retreat shell to charged backup"
+    if act and backup and act.hp <= 60 and energy_count(backup) >= 3 and energy_count(act) >= 1:
+        return 8000, "retreat dying active"
+    return -100, "avoid retreat"
+
+
+def score_to_hand(obs, opt):
+    """Bug Catching Set picks, Pokegear picks, generic takes."""
+    card = option_card(obs, opt)
+    cid = card.id if card else opt.cardId
+    ids = hand_ids(obs)
+
+    if cid == OGERPON_EX:
+        total_seen = ogerpon_in_play(obs) + ids.count(OGERPON_EX)
+        return (22000 if total_seen < 3 else 4000), "take Ogerpon"
+    if cid == GRASS_ENERGY:
+        need = 2 - grass_in_hand(obs)
+        return (20000 if need > 0 else 8000), "take energy"
+    if cid == GROW_GRASS:
+        return 18000, "take Grow Grass"
+    if cid == BOSS:
+        return 9000, "take Boss"
+    if cid in DRAW_SUPPORTERS:
+        sup_in_hand = sum(1 for c in ids if c in DRAW_SUPPORTERS or c == BOSS)
+        return (12000 if sup_in_hand == 0 else 2000), "take supporter"
+    if cid in (BUG_CATCHING_SET, ENERGY_SEARCH, TERA_ORB):
+        return 6000, "take search"
+    return 1000, "generic take"
+
+
+def score_discard(obs, opt):
+    card = option_card(obs, opt)
+    cid = card.id if card else opt.cardId
+    ids = hand_ids(obs)
+    if cid == HARLEQUIN:
+        return 10000, "discard Harlequin"
+    if cid == LIVELY_STADIUM and _lively_up(obs):
+        return 9000, "discard spare stadium"
+    if cid == GRASS_ENERGY and grass_in_hand(obs) > 2:
+        return 8000, "discard surplus energy"
+    if cid in (POKEGEAR, ENERGY_RETRIEVAL):
+        return 7000, "discard utility"
+    if cid == OGERPON_EX and (ogerpon_in_play(obs) + ids.count(OGERPON_EX)) > 3:
+        return 6000, "discard 4th Ogerpon"
+    if cid == OGERPON_EX:
+        return -5000, "keep Ogerpon"
+    if cid == GRASS_ENERGY:
+        return -2000, "keep energy"
+    return 1000, "generic discard"
+
+
+def score_target(obs, opt):
+    card = option_card(obs, opt)
+    cid = card.id if card else opt.cardId
+    ctx = obs.select.context
+    yi = obs.current.yourIndex
+    pi = getattr(opt, "playerIndex", yi)
+
+    if ctx == SelectContext.ATTACH_TO:
+        # N's Plan destination / energy attach target
+        return (attach_target_score(obs, card, opt.area), "attach to")
+
+    if ctx == SelectContext.ATTACH_FROM:
+        # N's Plan source: bench Ogerpon with most energy
+        return (2000 + energy_count(card) * 500, "move from loaded bench")
+
+    if ctx == SelectContext.HEAL:
+        return (20000 + damage_on(card), "heal") if card else (0, "heal none")
+
+    if ctx in {SelectContext.SWITCH, SelectContext.TO_ACTIVE}:
+        if pi != yi and card:
+            # Boss target: killable first, weighted by prize + their energy (feeds damage)
+            act = active_pokemon(obs)
+            my_e = energy_count(act) if act else 0
+            eff = shower_damage(obs, my_energy=my_e, target=card)
+            killable = eff >= card.hp
+            pv = prize_value(card)
+            te = energy_count(card)
+            if killable:
+                return 20000 + pv * 3000 + te * 300, "Boss: killable"
+            return 4000 + te * 500 - card.hp // 10, "Boss: stall loaded"
+        # our promotion after KO: most energy first
+        if cid == OGERPON_EX:
+            return 15000 + energy_count(card) * 1000 + card.hp, "promote charged Ogerpon"
+        return 1000, "generic promote"
+
+    if ctx == SelectContext.DAMAGE:
+        hp = getattr(card, "hp", 999) if card else 999
+        return 10000 - hp, "damage lowest HP"
+
+    if ctx in {SelectContext.TO_FIELD, SelectContext.TO_BENCH}:
+        return (16000, "field Ogerpon") if cid == OGERPON_EX else (1000, "generic")
+
+    return 1000, "generic target"
+
+
+def score_option(obs, opt):
+    ctx = obs.select.context
+
+    if ctx in {SelectContext.IS_FIRST, SelectContext.MULLIGAN,
+               SelectContext.SETUP_ACTIVE_POKEMON, SelectContext.SETUP_BENCH_POKEMON}:
+        return score_setup(obs, opt)
+
+    if opt.type in {OptionType.YES, OptionType.NO}:
+        if ctx == SelectContext.ACTIVATE:
+            # Teal Dance confirmation: +energy +draw, always take it when it can fire
+            if grass_in_hand(obs) > 0:
+                return (100000, "Teal Dance yes") if opt.type == OptionType.YES else (0, "no")
+            return (1, "yes") if opt.type == OptionType.YES else (0, "no")
+        return (1, "yes") if opt.type == OptionType.YES else (0, "no")
+
+    if opt.type == OptionType.NUMBER:
+        return (opt.number or 0), "number"
+
+    if ctx == SelectContext.MAIN:
+        if opt.type == OptionType.PLAY:
+            return score_play(obs, opt)
+        if opt.type == OptionType.ATTACH:
+            return score_attach(obs, opt)
+        if opt.type == OptionType.RETREAT:
+            return score_retreat(obs, opt)
+        if opt.type == OptionType.ABILITY:
+            # Teal Dance: fire on every Ogerpon while grass remains in hand
+            if grass_in_hand(obs) > 0:
+                return 90000, "Teal Dance"
+            return -500, "ability: no grass in hand"
+        if opt.type == OptionType.ATTACK:
+            act = active_pokemon(obs)
+            opp_act = opp_active_pokemon(obs)
+            dmg = shower_damage(obs)
+            # Attacking is free (no discard); always do it once the turn is set up.
+            return max(50, dmg), "Myriad Leaf Shower"
+        if opt.type == OptionType.EVOLVE:
+            return -500, "no evolutions in deck"
+        if opt.type == OptionType.END:
+            return 0, "end turn"
+        return 500, "generic MAIN"
+
+    if ctx == SelectContext.TO_HAND:
+        return score_to_hand(obs, opt)
+    if ctx in {SelectContext.DISCARD, SelectContext.DISCARD_CARD_OR_ATTACHED_CARD}:
+        return score_discard(obs, opt)
+    if ctx in {SelectContext.ATTACH_TO, SelectContext.TO_FIELD, SelectContext.TO_BENCH,
+               SelectContext.ATTACH_FROM, SelectContext.SWITCH, SelectContext.TO_ACTIVE,
+               SelectContext.HEAL, SelectContext.DAMAGE}:
+        return score_target(obs, opt)
+    if ctx == SelectContext.ATTACK:
+        return max(50, shower_damage(obs)), "attack"
+    if opt.type == OptionType.CARD:
+        return score_to_hand(obs, opt)
+    if opt.type == OptionType.ENERGY:
+        return 1000, "energy"
+    if opt.type == OptionType.END:
+        return 0, "end"
+    return 100, "fallback"
+
+
+# ── Choose & Agent (identical mechanics to llcc_stable) ──
+
+def choose_options(obs):
+    scored = []
+    for i, opt in enumerate(obs.select.option):
+        try:
+            score, reason = score_option(obs, opt)
+        except Exception as e:
+            score, reason = -999999, f"error {type(e).__name__}: {e}"
+        scored.append((score, i, reason))
+
+    scored.sort(key=lambda x: (x[0], -x[1]), reverse=True)
+
+    selected = []
+    for score, i, reason in scored:
+        if len(selected) >= obs.select.maxCount:
+            break
+        if score < 0 and len(selected) >= obs.select.minCount:
+            continue
+        selected.append(i)
+
+    if len(selected) < obs.select.minCount:
+        selected = [i for _, i, _ in scored[:obs.select.minCount]]
+
+    return selected
+
+
+def agent(obs_dict):
+    obs = to_observation_class(obs_dict)
+    if obs.select is None:
+        return read_deck_csv()
+    if not obs.select.option:
+        return []
+    try:
+        return choose_options(obs)
+    except Exception:
+        return random.sample(list(range(len(obs.select.option))), obs.select.maxCount)
