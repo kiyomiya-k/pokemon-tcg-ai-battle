@@ -11,9 +11,14 @@ TrueSkill 系レーティングで競う Kaggle Featured コンペティショ�
 | **手法** | **機械学習なし**。744行のルールベースパイロット + Teal Mask Ogerpon ex 単騎デッキ |
 | **期間** | 16日間・46提出（うち7提出は意図的に「測定」に使用） |
 
-> **📘 英語版の解法解説（Kaggle Discussion）** — 分散測定・帯別勝率曲線・
-> 400戦CI判定の詳細は、コンペの Discussion に投稿した writeup
-> "*Silver with zero ML*" を参照してください。本 README はその要約 + 実行手順です。
+> **📘 はじめての方へ** — [GUIDE_ja.md](GUIDE_ja.md) に、何のコンペか・なぜ難しいか・
+> この解法の考え方を、前提知識ゼロから用語解説付きで噛み砕いた説明を置いています。
+>
+> **🔧 コードの中身を追いたい方へ** — [SOLUTION_ja.md](SOLUTION_ja.md) に、
+> 評価ハーネス（`arena/`）とパイロットの実装をファイル単位で解説しています。
+>
+> **📗 英語版の解法解説** — 分散測定・帯別勝率曲線・400戦CI判定の詳細は、
+> コンペ Discussion の writeup "*Silver with zero ML*" を参照してください。
 
 ---
 
